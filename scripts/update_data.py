@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import copy
 import datetime as dt
@@ -19,6 +20,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 import urllib.error
+from zoneinfo import ZoneInfo
 
 NBA_TEAMS = {1610612737:'ATL',1610612738:'BOS',1610612739:'CLE',1610612740:'NOP',1610612741:'CHI',1610612742:'DAL',1610612743:'DEN',1610612744:'GSW',1610612745:'HOU',1610612746:'LAC',1610612747:'LAL',1610612748:'MIA',1610612749:'MIL',1610612750:'MIN',1610612751:'BKN',1610612752:'NYK',1610612753:'ORL',1610612754:'IND',1610612755:'PHI',1610612756:'PHX',1610612757:'POR',1610612758:'SAC',1610612759:'SAS',1610612760:'OKC',1610612761:'TOR',1610612762:'UTA',1610612763:'MEM',1610612764:'WAS',1610612765:'DET',1610612766:'CHA'}
 TYPES = {1:'Pre Season',2:'Regular Season',3:'Playoffs'}
@@ -40,6 +42,13 @@ def decode_response(raw, as_json):
     text = raw.decode('utf-8')
     return json.loads(text) if as_json else text
 
+def headers_for(url):
+    headers = dict(HTTP_HEADERS)
+    if (urllib.parse.urlsplit(url).hostname or '').endswith('.espn.com'):
+        headers.pop('Origin',None)
+        headers['Referer'] = 'https://www.espn.com/'
+    return headers
+
 def curl_request(url, as_json, timeout):
     """Try the runner's system HTTP client when urllib receives a rejection."""
     executable = shutil.which('curl')
@@ -49,7 +58,7 @@ def curl_request(url, as_json, timeout):
                '--proto','=https','--proto-redir','=https','--max-redirs','3',
                '--compressed','--connect-timeout','10','--max-time',str(timeout),
                '--max-filesize','25000000']
-    for name,value in HTTP_HEADERS.items():
+    for name,value in headers_for(url).items():
         command.extend(['--header',name+': '+value])
     command.append(url)
     result = subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
@@ -74,9 +83,11 @@ def request(url, as_json=True):
     # The season schedule is several MB; do not give it the short box-score timeout.
     timeout = 10 if small_box else 45 if cdn else 25
     attempts = 2 if small_box else 3
+    if (urllib.parse.urlsplit(url).hostname or '').endswith('.espn.com'):
+        timeout,attempts = 20,2
     for attempt in range(attempts):
         try:
-            req = urllib.request.Request(url, headers=HTTP_HEADERS)
+            req = urllib.request.Request(url, headers=headers_for(url))
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 return decode_response(response.read(25_000_001),as_json)
         except Exception as error:
@@ -548,6 +559,317 @@ def refresh_public(base,previous,fetch=request,now=None):
         feed['lastSuccessfulAt'] = at
     return feed
 
+ESPN_TEAMS = {'1':'ATL','2':'BOS','17':'BKN','30':'CHA','4':'CHI','5':'CLE','6':'DAL','7':'DEN','8':'DET','9':'GSW','10':'HOU','11':'IND','12':'LAC','13':'LAL','29':'MEM','14':'MIA','15':'MIL','16':'MIN','3':'NOP','18':'NYK','25':'OKC','19':'ORL','20':'PHI','21':'PHX','22':'POR','23':'SAC','24':'SAS','28':'TOR','26':'UTA','27':'WAS'}
+ESPN_ROOT = 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/'
+
+def espn_number(value):
+    if isinstance(value,bool) or value is None or value=='':
+        raise ValueError('ESPN 數值缺漏')
+    try:
+        result = float(value)
+    except (ValueError,TypeError) as error:
+        raise ValueError('ESPN 數值格式不符') from error
+    if not math.isfinite(result) or result<0:
+        raise ValueError('ESPN 數值無效')
+    return result
+
+def espn_time(value):
+    result = dt.datetime.fromisoformat(str(value).replace('Z','+00:00'))
+    if result.tzinfo is None:
+        raise ValueError('ESPN 比賽時間未提供時區')
+    return result
+
+def espn_event(event,year):
+    season = event.get('season',{})
+    if season.get('year')!=year or season.get('type') not in TYPES:
+        return None
+    if event.get('status',{}).get('type',{}).get('completed') is not True:
+        return None
+    competitions = event.get('competitions',[])
+    if len(competitions)!=1:
+        raise ValueError('ESPN 比賽結構不完整')
+    comp = competitions[0]
+    notes = ' '.join(str(n.get('headline') or '') for n in comp.get('notes',[]))
+    # Play-in, All-Star and the Cup championship do not count toward the
+    # corresponding standard regular-season or playoff player totals.
+    if re.search(r'play[ -]?in|all[ -]?star|NBA Cup.{0,30}\b(?:championship|finals?)\b',notes,re.I):
+        return None
+    teams = {c.get('homeAway'):c for c in comp.get('competitors',[])}
+    if set(teams)!={'home','away'}:
+        raise ValueError('ESPN 主客隊資料不完整')
+    if not any(str(c.get('id')) in ESPN_TEAMS for c in teams.values()):
+        return None
+    gid = str(event.get('id') or '')
+    if not gid.isdigit():
+        raise ValueError('ESPN 比賽 ID 缺漏')
+    date = espn_time(event['date'])
+    result = {'id':gid,'type':season['type'],'date':date.isoformat(),
+              'day':date.astimezone(ZoneInfo('America/New_York')).date().isoformat()}
+    for side,c in teams.items():
+        result[side] = {'id':str(c['id']),'score':espn_number(c.get('score')),
+                        'code':ESPN_TEAMS.get(str(c['id'])) or c.get('team',{}).get('abbreviation')}
+        if not result[side]['code']:
+            raise ValueError('ESPN 對手隊名缺漏')
+    if result['home']['score']==result['away']['score']:
+        raise ValueError('ESPN 完賽比分相同')
+    return result
+
+def fetch_espn_schedule(fetch,year,now):
+    # Fetch every elapsed month of the season, including earlier preseason
+    # games, rather than building season averages from a moving recent window.
+    current = now.astimezone(ZoneInfo('America/New_York')).date()
+    months = [(year-1,m) for m in range(9,13)]+[(year,m) for m in range(1,9)]
+    months = [(y,m) for y,m in months if (y,m)<=(current.year,current.month)]
+    games = {}
+    for y,m in months:
+        raw = fetch(ESPN_ROOT+f'scoreboard?dates={y}{m:02d}&limit=1000')
+        if not isinstance(raw.get('events'),list) or not any(str(l.get('id'))=='46' for l in raw.get('leagues',[])):
+            raise ValueError('ESPN NBA 賽程格式不符')
+        if len(raw['events'])>=1000:
+            raise ValueError('ESPN 賽程可能被截斷，保留舊資料')
+        for event in raw['events']:
+            game = espn_event(event,year)
+            if game:
+                if game['id'] in games and games[game['id']]!=game:
+                    raise ValueError('ESPN 重複場次資料互相衝突')
+                games[game['id']] = game
+    return games
+
+def espn_box_rows(raw,game,year):
+    header = raw.get('header',{})
+    if str(header.get('id'))!=game['id'] or header.get('season',{}).get('year')!=year or header.get('season',{}).get('type')!=game['type']:
+        raise ValueError('ESPN 逐場 ID、賽季或類型不符')
+    comps = header.get('competitions',[])
+    if len(comps)!=1 or comps[0].get('status',{}).get('type',{}).get('completed') is not True:
+        raise ValueError('ESPN 逐場尚未完賽')
+    comp = comps[0]
+    if espn_time(comp['date'])!=espn_time(game['date']):
+        raise ValueError('ESPN 逐場日期與賽程不符')
+    sides = {c.get('homeAway'):c for c in comp.get('competitors',[])}
+    for side in ('home','away'):
+        c = sides.get(side,{})
+        if str(c.get('id'))!=game[side]['id'] or espn_number(c.get('score'))!=game[side]['score']:
+            raise ValueError('ESPN 逐場球隊或比分與賽程不符')
+    groups = raw.get('boxscore',{}).get('players')
+    if not isinstance(groups,list):
+        raise ValueError('ESPN 逐場球員資料缺漏')
+    rows,seen,covered = [],set(),set()
+    for group in groups:
+        tid = str(group.get('team',{}).get('id'))
+        side = next((s for s in ('home','away') if game[s]['id']==tid),None)
+        if not side:
+            raise ValueError('ESPN 逐場出現不符的球隊')
+        if tid not in ESPN_TEAMS:
+            continue
+        if tid in covered:
+            raise ValueError('ESPN 逐場球隊重複')
+        covered.add(tid)
+        other = game['away' if side=='home' else 'home']
+        own = game[side]
+        points = 0
+        for stat in group.get('statistics',[]):
+            names = stat.get('names',[])
+            required = {'MIN','PTS','FG','3PT','REB','AST','STL','BLK'}
+            if not required.issubset(names) or not isinstance(stat.get('athletes'),list):
+                raise ValueError('ESPN 逐場欄位變更')
+            for record in stat['athletes']:
+                if record.get('didNotPlay') is True:
+                    continue
+                values = record.get('stats',[])
+                if len(values)!=len(names):
+                    raise ValueError('ESPN 球員逐場數字不完整')
+                values = dict(zip(names,values))
+                text = str(values['MIN']).strip()
+                if text.upper().startswith(('DNP','DND','NWT')):
+                    continue
+                if text in ('--',''):
+                    # ESPN occasionally includes a placeholder line with no
+                    # minutes, all-zero stats and didNotPlay=false. It is not
+                    # evidence of an appearance. A nonzero line is an error.
+                    if all(re.fullmatch(r'[+\-]?0(?:\.0+)?(?:\s*-\s*0)?',str(v).strip()) for k,v in values.items() if k!='MIN'):
+                        continue
+                    raise ValueError('ESPN 球員有數據卻缺少出賽時間')
+                played = espn_number(text) if re.fullmatch(r'\d+(?:\.\d+)?',text) else minutes(text)
+                # ESPN rounds some box-score minutes to whole minutes. A
+                # non-DNP line at 0 minutes still counts as an appearance.
+                played = max(played,0.001)
+                athlete = record.get('athlete',{})
+                eid,name = str(athlete.get('id') or ''),athlete.get('displayName')
+                if not eid.isdigit() or not name or eid in seen:
+                    raise ValueError('ESPN 球員識別資料缺漏或重複')
+                seen.add(eid)
+                numeric = {k:espn_number(values[label]) for k,label in [('pts','PTS'),('reb','REB'),('ast','AST'),('stl','STL'),('blk','BLK')]}
+                for label,made,attempted in [('FG','fgm','fga'),('3PT','tpm','tpa')]:
+                    match = re.fullmatch(r'(\d+)\s*-\s*(\d+)',str(values[label]))
+                    if not match or int(match[1])>int(match[2]):
+                        raise ValueError('ESPN 投籃命中與出手數不完整')
+                    numeric[made],numeric[attempted] = int(match[1]),int(match[2])
+                if numeric['tpm']>numeric['fgm'] or numeric['tpa']>numeric['fga']:
+                    raise ValueError('ESPN 三分數字與投籃數字不符')
+                rows.append({'espnId':eid,'name':name,'position':athlete.get('position',{}).get('abbreviation',''),
+                             'game':{'id':game['id'],'date':game['day'],'team':ESPN_TEAMS[tid],
+                                     'matchup':ESPN_TEAMS[tid]+(' vs. ' if side=='home' else ' @ ')+other['code'],
+                                     'opponent':other['code'],'home':side=='home','result':'W' if own['score']>other['score'] else 'L',
+                                     'min':played,**numeric}})
+                points += numeric['pts']
+        if points!=own['score']:
+            raise ValueError('ESPN 球員得分合計與完賽比分不符，保留舊資料')
+    expected = {game[s]['id'] for s in ('home','away') if game[s]['id'] in ESPN_TEAMS}
+    if covered!=expected or not rows:
+        raise ValueError('ESPN 逐場球員或球隊未完整提供')
+    return rows
+
+def espn_identity_index(base,feed):
+    by_id,by_name = {},{}
+    players = base.get('nba',[])+base.get('espn',[])
+    for sets in (base.get('nbaSets',{}),feed.get('nbaSets',{}),feed.get('espnSets',{})):
+        players += [p for data in sets.values() for p in data.get('players',[])]
+    for p in players:
+        if p.get('espnId'):
+            by_id[str(p['espnId'])] = p
+        key = normalize(p.get('name'))
+        if key and p.get('nbaId'):
+            by_name.setdefault(key,{})[str(p['nbaId'])] = p
+    names = {key:next(iter(v.values())) for key,v in by_name.items() if len(v)==1}
+    return by_id,names
+
+def espn_identity(eid,name,index):
+    by_id,by_name = index
+    known = by_id.get(eid) or by_name.get(normalize(name),{})
+    nba = str(known['nbaId']) if known.get('nbaId') else None
+    return {**known,'id':nba or 'e'+eid,'nbaId':nba,'espnId':eid,'name':name,
+            'alias':known.get('alias',''),'source':'ESPN'}
+
+def build_espn_period(rows,year,typ,index,roster,at):
+    players,games,identities = {},{},{}
+    for row in rows:
+        p = espn_identity(row['espnId'],row['name'],index)
+        pid,g = p['id'],row['game']
+        p['position'] = row['position'] or p.get('position','')
+        identities[pid] = p
+        if g['id'] in games.setdefault(pid,{}) and games[pid][g['id']]!=g:
+            raise ValueError('ESPN 同一球員逐場資料互相衝突')
+        games[pid][g['id']] = g
+    recent = []
+    for pid,unique in games.items():
+        ordered = sorted(unique.values(),key=lambda g:(g['date'],g['id']),reverse=True)
+        teams = {g['team'] for g in ordered}
+        p = {**identities[pid],**summarize(ordered),'season':year,'seasonType':typ,
+             'team':next(iter(teams)) if len(teams)==1 else 'TOT'}
+        p['position'] = roster.get(pid,{}).get('position') or p.get('position','')
+        players[pid] = p
+        recent.append({'player':p,'games':ordered[:5]})
+    latest = max((r['games'][0]['date'] for r in recent),default=None)
+    common = {'at':at,'source':'ESPN','complete':True,'season':year,'seasonType':typ,
+              'method':'ESPN complete season box scores','url':'https://www.espn.com/nba/scoreboard'}
+    return ({**common,'players':list(players.values()),'lastGameDate':latest},
+            {**common,'players':recent,'latestGameDate':latest})
+
+def refresh_espn(base,previous,fetch=request,now=None):
+    now = now or dt.datetime.now(dt.timezone.utc)
+    at = now.isoformat(timespec='seconds')
+    tw = now.astimezone(dt.timezone(dt.timedelta(hours=8)))
+    year = tw.year+(tw.month>=9)
+    feed = copy.deepcopy(previous or seed_feed(base))
+    if feed.get('schemaVersion') not in (1,2):
+        raise ValueError('既有更新資料版本不符')
+    feed.setdefault('espnSets',{})
+    feed.setdefault('espnSpotlightSets',{})
+    index = espn_identity_index(base,feed)
+    errors = {}
+    try:
+        roster = {}
+        def team_roster(tid):
+            raw = fetch(ESPN_ROOT+f'teams/{tid}/roster')
+            if str(raw.get('team',{}).get('id'))!=tid or raw.get('season',{}).get('year')!=year or not isinstance(raw.get('athletes'),list):
+                raise ValueError('ESPN 球隊名單的賽季或球隊不符')
+            result = {}
+            for athlete in raw['athletes']:
+                eid,name = str(athlete.get('id') or ''),athlete.get('displayName')
+                if not eid.isdigit() or not name:
+                    raise ValueError('ESPN 名單缺少球員識別資料')
+                p = espn_identity(eid,name,index)
+                result[p['id']] = {'team':ESPN_TEAMS[tid],'position':athlete.get('position',{}).get('abbreviation','')}
+            return result
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            for part in executor.map(team_roster,ESPN_TEAMS):
+                for pid,value in part.items():
+                    if pid in roster and roster[pid]['team']!=value['team']:
+                        raise ValueError('ESPN 同一球員目前球隊互相衝突')
+                    roster[pid] = value
+        if len(roster)<300:
+            raise ValueError('ESPN 30 隊名單不完整')
+        feed.update({'currentRoster':roster,'rosterFetchedAt':at,'rosterIsComplete':True,'rosterSource':'ESPN'})
+        print(f'ESPN roster: {len(roster)} current players',flush=True)
+    except Exception as error:
+        errors['roster'] = str(error)
+    try:
+        games = fetch_espn_schedule(fetch,year,now)
+        print(f'ESPN schedule: {len(games)} completed games',flush=True)
+        stored = feed.get('_espnBoxCache',{})
+        cache = {}
+        if stored.get('season')==year and stored.get('version')==1 and stored.get('encoded'):
+            decoded = gzip.decompress(base64.b64decode(stored['encoded'],validate=True))
+            if len(decoded)>40_000_000:
+                raise ValueError('ESPN 快取大小異常')
+            cache = json.loads(decoded)
+        def signature(g):
+            return [g['date'],g['type'],g['home']['id'],g['away']['id'],g['home']['score'],g['away']['score']]
+        cutoff = (now-dt.timedelta(days=2)).date().isoformat()
+        todo = [g for gid,g in games.items() if gid not in cache or cache[gid].get('signature')!=signature(g) or g['day']>=cutoff]
+        def box(g):
+            return espn_box_rows(fetch(ESPN_ROOT+'summary?event='+g['id']),g,year)
+        failed = {}
+        print(f'ESPN box scores: {len(todo)} fetches; {len(games)-len(todo)} cached games',flush=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            jobs = {executor.submit(box,g):g for g in todo}
+            for job in concurrent.futures.as_completed(jobs):
+                game = jobs[job]
+                try:
+                    cache[game['id']] = {'signature':signature(game),'rows':job.result(),'at':at}
+                except Exception as error:
+                    failed[game['id']] = str(error)
+        print(f'ESPN box scores: {len(games)-len(failed)} complete; {len(failed)} failed',flush=True)
+        cache = {gid:entry for gid,entry in cache.items() if gid in games}
+        encoded = gzip.compress(json.dumps(cache,ensure_ascii=False,separators=(',',':')).encode(),mtime=0)
+        feed['_espnBoxCache'] = {'version':1,'season':year,'encoded':base64.b64encode(encoded).decode()}
+        for typ in TYPES:
+            key = f'{year}:{typ}'
+            try:
+                ids = [gid for gid,g in games.items() if g['type']==typ]
+                missing = [gid for gid in ids if gid in failed or gid not in cache]
+                if missing:
+                    raise ValueError(f'{len(missing)} 場 ESPN 逐場資料未完成，保留整個期間：'+failed.get(missing[0],'資料缺漏'))
+                rows = [row for gid in ids for row in cache[gid]['rows']]
+                stats,focus = build_espn_period(rows,year,typ,index,feed['currentRoster'],at)
+                prevent_regression(feed['espnSets'].get(key),stats)
+                stats['completedGames'] = focus['completedGames'] = len(ids)
+                feed['espnSets'][key],feed['espnSpotlightSets'][key] = stats,focus
+            except Exception as error:
+                errors['espn:'+key] = str(error)
+    except Exception as error:
+        for typ in TYPES:
+            errors[f'espn:{year}:{typ}'] = str(error)
+    available = [typ for typ in TYPES if feed['espnSets'].get(f'{year}:{typ}',{}).get('players')]
+    if available:
+        feed['defaultSeason'],feed['defaultType'] = year,max(available)
+    elif all(f'{year}:{typ}' in feed['espnSets'] for typ in TYPES):
+        feed['defaultSeason'],feed['defaultType'] = year,1
+    try:
+        fresh = parse_nba_news(fetch('https://www.nba.com/news',False))
+        merged = {n['url']:n for n in feed.get('news',[]) if n.get('source')=='NBA'}
+        merged.update({n['url']:n for n in fresh})
+        feed['news'] = sorted(merged.values(),key=lambda n:n.get('publishedAt') or '',reverse=True)[:150]
+        feed['newsFetchedAtBySource']['NBA'] = at
+    except Exception as error:
+        errors['news:NBA'] = str(error)
+    feed.update({'schemaVersion':2,'attemptedAt':at,'intervalHours':4,'updaterVersion':4,
+                 'status':'partial' if errors else 'success','errors':errors,
+                 'dataMethod':'ESPN complete season box scores; NBA official news','preferredSource':'espn'})
+    if not errors:
+        feed['lastSuccessfulAt'] = at
+    return feed
+
 def write_atomic(path, feed):
     path = Path(path)
     path.parent.mkdir(parents=True,exist_ok=True)
@@ -559,22 +881,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source',default='index.html')
     parser.add_argument('--output',default='data/latest.json')
-    parser.add_argument('--source-method',choices=['auto','public','stats'],default='auto')
+    parser.add_argument('--source-method',choices=['auto','espn','public','stats'],default='auto')
     args = parser.parse_args()
     base = load_base(args.source)
     path = Path(args.output)
     previous = json.loads(path.read_text()) if path.exists() else None
-    use_public = args.source_method!='stats'
-    print('COURTSIDE updater v3 source: '+('NBA official public pages (alternate endpoints + curl fallback)' if use_public else 'NBA statistics API'),flush=True)
-    feed = refresh(base,previous,public=use_public)
-    feed['updaterVersion'] = 3
+    use_espn = args.source_method in ('auto','espn')
+    print('COURTSIDE updater v4 source: '+('ESPN complete season box scores + NBA news' if use_espn else args.source_method),flush=True)
+    feed = refresh_espn(base,previous) if use_espn else refresh(base,previous,public=args.source_method=='public')
+    feed['updaterVersion'] = 4
     write_atomic(path,feed)
     print(json.dumps({'status':feed['status'],'attemptedAt':feed['attemptedAt'],'defaultSeason':feed['defaultSeason'],'defaultType':feed['defaultType'],'errors':feed['errors']},ensure_ascii=False))
     summary = os.environ.get('GITHUB_STEP_SUMMARY')
     if summary:
         with open(summary,'a',encoding='utf-8') as file:
             file.write(f"COURTSIDE data update: **{feed['status']}**\n\nAttempted: {feed['attemptedAt']}\n\n")
-            file.write('Updater: **v3**\n\n')
+            file.write('Updater: **v4**\n\n')
             file.write('Source: '+feed.get('dataMethod','NBA statistics API')+'\n\n')
             for key,error in feed['errors'].items():
                 file.write(f'- {key}: {error}\n')
