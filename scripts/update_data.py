@@ -12,6 +12,8 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import time
 import unicodedata
 import urllib.parse
@@ -21,6 +23,40 @@ import urllib.error
 NBA_TEAMS = {1610612737:'ATL',1610612738:'BOS',1610612739:'CLE',1610612740:'NOP',1610612741:'CHI',1610612742:'DAL',1610612743:'DEN',1610612744:'GSW',1610612745:'HOU',1610612746:'LAC',1610612747:'LAL',1610612748:'MIA',1610612749:'MIL',1610612750:'MIN',1610612751:'BKN',1610612752:'NYK',1610612753:'ORL',1610612754:'IND',1610612755:'PHI',1610612756:'PHX',1610612757:'POR',1610612758:'SAC',1610612759:'SAS',1610612760:'OKC',1610612761:'TOR',1610612762:'UTA',1610612763:'MEM',1610612764:'WAS',1610612765:'DET',1610612766:'CHA'}
 TYPES = {1:'Pre Season',2:'Regular Season',3:'Playoffs'}
 BOX_FIELDS = ['PLAYER_ID','PLAYER_NAME','TEAM_ID','GAME_ID','GAME_DATE','MATCHUP','WL','MIN','PTS','REB','AST','FGM','FGA','FG3M','FG3A','STL','BLK']
+HTTP_HEADERS = {
+    'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36',
+    'Referer':'https://www.nba.com/', 'Origin':'https://www.nba.com',
+    'Accept':'application/json,text/html;q=0.9,*/*;q=0.8',
+    'Accept-Language':'en-US,en;q=0.9',
+}
+
+def decode_response(raw, as_json):
+    if len(raw)>25_000_000:
+        raise ValueError('來源回應超過預期大小')
+    if raw[:2]==b'\x1f\x8b':
+        raw = gzip.decompress(raw)
+    if len(raw)>25_000_000:
+        raise ValueError('解壓縮後的來源回應超過預期大小')
+    text = raw.decode('utf-8')
+    return json.loads(text) if as_json else text
+
+def curl_request(url, as_json, timeout):
+    """Try the runner's system HTTP client when urllib receives a rejection."""
+    executable = shutil.which('curl')
+    if not executable:
+        raise RuntimeError('系統未提供 curl 備援連線')
+    command = [executable,'--silent','--show-error','--fail','--location',
+               '--proto','=https','--proto-redir','=https','--max-redirs','3',
+               '--compressed','--connect-timeout','10','--max-time',str(timeout),
+               '--max-filesize','25000000']
+    for name,value in HTTP_HEADERS.items():
+        command.extend(['--header',name+': '+value])
+    command.append(url)
+    result = subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                            timeout=timeout+5,check=False)
+    if result.returncode:
+        raise RuntimeError(result.stderr.decode('utf-8',errors='replace').strip()[:400])
+    return decode_response(result.stdout,as_json)
 
 def utc_now():
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
@@ -40,26 +76,21 @@ def request(url, as_json=True):
     attempts = 2 if small_box else 3
     for attempt in range(attempts):
         try:
-            req = urllib.request.Request(url, headers={
-                'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36',
-                'Referer':'https://www.nba.com/', 'Origin':'https://www.nba.com',
-                'Accept':'application/json,text/html;q=0.9,*/*;q=0.8',
-            })
+            req = urllib.request.Request(url, headers=HTTP_HEADERS)
             with urllib.request.urlopen(req, timeout=timeout) as response:
-                raw = response.read(25_000_001)
-                if len(raw)>25_000_000:
-                    raise ValueError('來源回應超過預期大小')
-                if raw[:2]==b'\x1f\x8b':
-                    raw = gzip.decompress(raw)
-                text = raw.decode('utf-8')
-                return json.loads(text) if as_json else text
+                return decode_response(response.read(25_000_001),as_json)
         except Exception as error:
             last_error = error
             if isinstance(error,urllib.error.HTTPError) and error.code in (403,404):
+                if error.code==403:
+                    try:
+                        return curl_request(url,as_json,timeout)
+                    except Exception as curl_error:
+                        last_error = RuntimeError(f'urllib: HTTP 403; curl: {curl_error}')
                 break
             if attempt<attempts-1:
                 time.sleep(2*(attempt+1))
-    raise RuntimeError(f'來源讀取失敗：{last_error}') from last_error
+    raise RuntimeError(f'來源讀取失敗 [{url}]：{last_error}') from last_error
 
 def table(payload, name, required):
     result = next((r for r in payload.get('resultSets', []) if r.get('name')==name), None)
@@ -271,6 +302,52 @@ def next_props(raw):
     return json.loads(match[1]).get('props',{}).get('pageProps',{})
 
 
+def public_roster(payload):
+    players = payload.get('players')
+    if not isinstance(players,list):
+        raise ValueError('NBA 公開球員名單格式不符')
+    roster = {str(p['PERSON_ID']):{'team':NBA_TEAMS.get(p.get('TEAM_ID'),'UNK'),'position':p.get('POSITION') or ''}
+              for p in players if str(p.get('PERSON_ID') or '').isdigit() and not p.get('HISTORIC')}
+    if len(roster)<300:
+        raise ValueError('NBA 公開球員名單不完整')
+    return roster
+
+
+def fetch_public_roster(fetch):
+    failures = []
+    for url in ('https://www.nba.com/players','https://www.nba.com/players?team=all'):
+        try:
+            return public_roster(next_props(fetch(url,False)))
+        except Exception as error:
+            failures.append(f'{url}: {error}')
+    # Next.js exposes the same page data separately. Discover its current
+    # build ID from the accessible official news page instead of hardcoding it.
+    try:
+        raw = fetch('https://www.nba.com/news',False)
+        match = re.search(r'<script\b[^>]*\bid=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',raw,re.S)
+        build = json.loads(match[1]).get('buildId') if match else None
+        if not isinstance(build,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',build):
+            raise ValueError('NBA 頁面未提供有效的資料版本')
+        url = f'https://www.nba.com/_next/data/{build}/players.json'
+        payload = fetch(url)
+        return public_roster(payload.get('pageProps',payload.get('props',{}).get('pageProps',{})))
+    except Exception as error:
+        failures.append(f'NBA 頁面資料: {error}')
+    raise RuntimeError('NBA 球員名單所有入口均失敗；'+' | '.join(failures))
+
+
+def fetch_public_schedule(fetch,year):
+    failures = []
+    for url in ('https://cdn.nba.com/static/json/staticData/scheduleLeagueV2_1.json',
+                'https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json',
+                'https://cdn.nba.com/static/json/staticData/scheduleLeagueV2_1.json?source=www.nba.com'):
+        try:
+            return public_schedule(fetch(url),year),url
+        except Exception as error:
+            failures.append(f'{url}: {error}')
+    raise RuntimeError('NBA 賽程所有入口均失敗；'+' | '.join(failures))
+
+
 def public_schedule(payload,year):
     league = payload.get('leagueSchedule',{})
     if league.get('seasonYear')!=f'{year-1}-{str(year)[-2:]}' or not isinstance(league.get('gameDates'),list):
@@ -368,15 +445,18 @@ def fetch_public_box(game,fetch):
     away = game['awayTeam']['teamTricode'].lower()
     home = game['homeTeam']['teamTricode'].lower()
     page = f"https://www.nba.com/game/{away}-vs-{home}-{game['gameId']}/box-score"
-    url = f"https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{game['gameId']}.json?source=www.nba.com"
-    try:
-        return public_box_rows(fetch(url).get('game',{}),game),url
-    except Exception as cdn_error:
+    cdn = f"https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{game['gameId']}.json"
+    failures = []
+    for url in (cdn,cdn+'?source=www.nba.com'):
         try:
-            box = next_props(fetch(page,False)).get('game',{})
-            return public_box_rows(box,game),page
-        except Exception as page_error:
-            raise ValueError(f'NBA 官方比賽頁與公開逐場資料均失敗：{page_error}; {cdn_error}') from cdn_error
+            return public_box_rows(fetch(url).get('game',{}),game),url
+        except Exception as error:
+            failures.append(str(error))
+    try:
+        box = next_props(fetch(page,False)).get('game',{})
+        return public_box_rows(box,game),page
+    except Exception as page_error:
+        raise ValueError(f'NBA 官方比賽頁與公開逐場資料均失敗：{page_error}; '+ '; '.join(failures)) from page_error
 
 
 def game_signature(game):
@@ -401,19 +481,12 @@ def refresh_public(base,previous,fetch=request,now=None):
     for name,value in base.get('idMap',{}).items():
         identities.setdefault(name,value)
     try:
-        players = next_props(fetch('https://www.nba.com/players',False)).get('players')
-        if not isinstance(players,list):
-            raise ValueError('NBA 公開球員名單格式不符')
-        roster = {str(p['PERSON_ID']):{'team':NBA_TEAMS.get(p.get('TEAM_ID'),'UNK'),'position':p.get('POSITION') or ''}
-                  for p in players if str(p.get('PERSON_ID') or '').isdigit() and not p.get('HISTORIC')}
-        if len(roster)<300:
-            raise ValueError('NBA 公開球員名單不完整')
+        roster = fetch_public_roster(fetch)
         feed['currentRoster'],feed['rosterFetchedAt'],feed['rosterIsComplete'] = roster,at,True
     except Exception as error:
         errors['roster'] = str(error)
     try:
-        schedule_url = 'https://cdn.nba.com/static/json/staticData/scheduleLeagueV2_1.json?source=www.nba.com'
-        games = public_schedule(fetch(schedule_url),year)
+        games,schedule_url = fetch_public_schedule(fetch,year)
         season = f'{year-1}-{str(year)[-2:]}'
         cache = feed.get('_nbaBoxCache',{})
         if cache.get('season')!=season or cache.get('fields')!=BOX_FIELDS or not isinstance(cache.get('games'),dict):
@@ -492,14 +565,16 @@ def main():
     path = Path(args.output)
     previous = json.loads(path.read_text()) if path.exists() else None
     use_public = args.source_method!='stats'
-    print('COURTSIDE updater v2 source: '+('NBA official public pages' if use_public else 'NBA statistics API'),flush=True)
+    print('COURTSIDE updater v3 source: '+('NBA official public pages (alternate endpoints + curl fallback)' if use_public else 'NBA statistics API'),flush=True)
     feed = refresh(base,previous,public=use_public)
+    feed['updaterVersion'] = 3
     write_atomic(path,feed)
     print(json.dumps({'status':feed['status'],'attemptedAt':feed['attemptedAt'],'defaultSeason':feed['defaultSeason'],'defaultType':feed['defaultType'],'errors':feed['errors']},ensure_ascii=False))
     summary = os.environ.get('GITHUB_STEP_SUMMARY')
     if summary:
         with open(summary,'a',encoding='utf-8') as file:
             file.write(f"COURTSIDE data update: **{feed['status']}**\n\nAttempted: {feed['attemptedAt']}\n\n")
+            file.write('Updater: **v3**\n\n')
             file.write('Source: '+feed.get('dataMethod','NBA statistics API')+'\n\n')
             for key,error in feed['errors'].items():
                 file.write(f'- {key}: {error}\n')
