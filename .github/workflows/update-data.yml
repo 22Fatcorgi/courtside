@@ -1,0 +1,54 @@
+name: Update NBA data
+
+on:
+  schedule:
+    - cron: '23 */4 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/update-data.yml'
+      - 'scripts/update_data.py'
+      - 'tests/test_update_data.py'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: courtside-data-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test updater
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Retrieve NBA statistics and news
+        id: refresh
+        continue-on-error: true
+        run: python scripts/update_data.py
+
+      - name: Preserve latest results and update status
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/latest.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'Refresh NBA statistics, last-five rankings and news'
+            git push origin HEAD:main
+          fi
+
+      - name: Report incomplete refresh
+        if: steps.refresh.outcome == 'failure'
+        run: |
+          echo 'An NBA source failed. Previous successful data was preserved.'
+          exit 1
